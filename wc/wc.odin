@@ -31,6 +31,11 @@ Result :: struct {
 /* 	return */
 /* } */
 
+usage :: proc() {
+	fmt.fprintf(os.stderr, "usage: wc [-clw] [FILE...]\n")
+	os.exit(1)
+}
+
 parse_args_unix :: proc() -> (opt: Options, files: [dynamic]string) {
 	for o in os.args[1:] {
 		switch o {
@@ -40,10 +45,12 @@ parse_args_unix :: proc() -> (opt: Options, files: [dynamic]string) {
 			opt.lines = true
 		case "-w":
 			opt.words = true
+		case "-h":
+			usage()
 		case:
 			if o != "-" && o[0] == '-' {
 				fmt.fprintf(os.stderr, "bad option %v\n", o)
-				os.exit(1)
+				usage()
 			}
 			append(&files, o)
 		}
