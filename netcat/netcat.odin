@@ -21,45 +21,25 @@ import "core:flags"
 import "core:fmt"
 import "core:net"
 import "core:os"
+import "core:strconv"
 import "core:sys/posix"
 
 Error :: union #shared_nil {
 	net.Network_Error,
+	net.Parse_Endpoint_Error,
 	posix.Errno,
 	os.Error,
 }
 
 Options :: struct {
-	inet4: bool `args:"name=4" usage:"use ipv4"`,
-	inet6: bool `args:"name=6" usage:"use ipv6"`,
-	ep:    net.Host_Or_Endpoint `args:"pos=0" usage:"host:port"`,
+	inet4:  bool `args:"name=4" usage:"use ipv4"`,
+	inet6:  bool `args:"name=6" usage:"use ipv6"`,
+	listen: bool `args:"name=l" usage:"listen"`,
+	pos0:   string `args:"pos=0" usage:"host or port"`,
+	pos1:   string `args:"pos=1" usage:"port if host"`,
 }
 
-flag_checker :: proc(
-	model: rawptr,
-	name: string,
-	value: any,
-	args_tag: string,
-) -> (
-	error: string,
-) {
-	port: int
-
-	switch t in value.(net.Host_Or_Endpoint) {
-	case net.Endpoint:
-		port = t.port
-	case net.Host:
-		port = t.port
-	}
-
-	if port == 0 {
-		error = "must specify port, like `192.168.1.1:22`"
-	}
-
-	return
-}
-
-write_all :: proc (h: os.Handle, buf: []byte) -> (err: Error) {
+write_all :: proc(h: os.Handle, buf: []byte) -> (err: Error) {
 	wn_total: int
 
 	for wn_total < len(buf) {
@@ -69,27 +49,11 @@ write_all :: proc (h: os.Handle, buf: []byte) -> (err: Error) {
 	return
 }
 
-tcp_dial_ep :: proc(target: net.Host_Or_Endpoint) -> (sock: net.TCP_Socket, err: Error) {
-	switch t in target {
-	case net.Host:
-		sock, err = net.dial_tcp(t.hostname, t.port)
-	case net.Endpoint:
-		sock, err = net.dial_tcp(t)
-	}
-	return
-}
-
-
-doit :: proc(opt: Options) -> (err: Error) {
+conn_loop :: proc(sock: net.TCP_Socket) -> (err: Error) {
 	pfds: [2]posix.pollfd
 	buffer := make([]byte, 16384)
 	defer {
 		delete(buffer)
-	}
-
-	sock := tcp_dial_ep(opt.ep) or_return
-	defer {
-		net.close(sock)
 	}
 
 	pfds[0].fd = 0
@@ -120,7 +84,7 @@ doit :: proc(opt: Options) -> (err: Error) {
 				return
 			}
 
-			other: = os.Handle(pfds[1].fd if i == 0 else pfds[0].fd)
+			other := os.Handle(pfds[1].fd if i == 0 else pfds[0].fd)
 			write_all(other, buffer[:rn]) or_return
 		}
 	}
@@ -128,15 +92,77 @@ doit :: proc(opt: Options) -> (err: Error) {
 	return
 }
 
-main :: proc() {
+parse_host_port :: proc(opt: Options) -> (ep: net.Endpoint, err: Error) {
+	ok: bool
+
+	portpos := opt.listen && opt.pos1 == "" ? opt.pos0 : opt.pos1
+	ep.port, ok = strconv.parse_int(portpos, 10)
+
+	if !ok || ep.port <= 0 || ep.port > 65535 {
+		err = net.Network_Error(.Bad_Port)
+		return
+	}
+
+	if opt.listen && opt.pos1 == "" {
+		ep.address = opt.inet6 ? net.IP6_Any : net.IP4_Any
+		return
+	}
+
+	host_or_ep := net.parse_hostname_or_endpoint(opt.pos0) or_return
+	switch t in host_or_ep {
+	case net.Endpoint:
+		ep.address = t.address
+	case net.Host:
+		ep4, ep6 := net.resolve(t.hostname) or_return
+		ep.address = opt.inet6 ? ep6.address : ep4.address
+		if ep.address == nil && !opt.inet6 && !opt.inet4 {
+			ep.address = ep6.address
+		}
+		if ep.address == nil {
+			err = net.Network_Error(.Invalid_Hostname_Error)
+			return
+		}
+	}
+
+	return
+}
+
+peer_sock :: proc(opt: Options, ep: net.Endpoint) -> (sock: net.TCP_Socket, err: Error) {
+	if !opt.listen {
+		return net.dial_tcp(ep)
+	}
+
+	listen_fd := net.listen_tcp(ep, 1) or_return
+	defer {
+		net.close(listen_fd)
+	}
+
+	sock, _, err = net.accept_tcp(listen_fd)
+
+	return
+}
+
+main_ :: proc() -> (err: Error) {
 	opt: Options
 
-	flags.register_flag_checker(flag_checker)
 	flags.parse_or_exit(&opt, os.args)
+	if opt.inet4 && opt.inet6 {
+		opt.inet4 = false
+		opt.inet6 = false
+	}
 
-	err := doit(opt)
+	ep := parse_host_port(opt) or_return
+	sock := peer_sock(opt, ep) or_return
+	defer {
+		net.close(sock)
+	}
+	return conn_loop(sock)
+}
+
+main :: proc() {
+	err := main_()
 	if err != nil {
-		fmt.fprintf(os.stderr, "netcat: %w", err)
+		fmt.fprintf(os.stderr, "netcat: %w\n", err)
 		os.exit(1)
 	}
 	/* clean up runtime allocations :/ */
