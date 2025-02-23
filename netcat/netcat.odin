@@ -166,6 +166,5 @@ main :: proc() {
 		os.exit(1)
 	}
 	/* clean up runtime allocations :/ */
-	net.destroy_dns_configuration()
 	delete(os.args)
 }
